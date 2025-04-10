@@ -1,6 +1,7 @@
 // server.mjs
 import dotenv from 'dotenv';
 dotenv.config();
+import google from 'googlethis';
 
 import express from 'express';
 import cors from 'cors';
@@ -32,6 +33,7 @@ const fallback = {
     'quality assurance engineer', 'devops engineer'
   ]
 };
+
 // ✨ Extract relevant keywords from resume
 async function extractKeywords(resume) {
   const prompt = `You are a job-matching assistant.
@@ -80,14 +82,45 @@ ${resume.trim()}`;
     }
   } catch (err) {
     console.error('❌ Failed to extract keywords:', err);
-    return [];
+    return fallback;
   }
 }
 
-// 🔍 Match relevance
-function isRelevant(job, keywords) {
-  const text = `${job.title || ''} ${job.description || job.snippet || job.summary || ''}`.toLowerCase();
-  return keywords.some(kw => text.includes(kw.toLowerCase()));
+// 🔍 Google Search
+async function searchWithGoogle(keywords, roles) {
+  const query = `${keywords.slice(0, 5).join(' ')} ${roles.join(' OR ')} site:.au jobs`;
+  const options = { page: 0, safe: false, parse_ads: false };
+  const response = await google.search(query, options);
+  return response.results.map(r => ({
+    title: r.title,
+    description: r.description,
+    link: r.url
+  }));
+}
+
+// 🔍 AI фильтрация ссылок
+async function filterJobLinksWithAI(resume, googleResults) {
+  const prompt = `You are a job relevance assistant. You will receive a resume and a list of web search results (title, snippet, url). Your task is to identify and extract job postings relevant to the resume. Return a JSON array of objects with the following format:
+
+[
+  {
+    "title": "Job Title",
+    "company": "Company Name (if found)",
+    "link": "URL",
+    "date": "if found",
+    "reason": "why it's relevant"
+  }
+]
+
+Resume:
+${resume.trim()}
+
+Results:
+${JSON.stringify(googleResults, null, 2)}`;
+
+  const messages = [{ role: 'user', content: prompt }];
+  const reply = await getCompletion(messages);
+  return JSON.parse(reply);
 }
 
 // 📍 Расширенная проверка локации
@@ -96,7 +129,7 @@ function isInAustralia(location = '') {
   return ['australia', 'sydney', 'remote au', 'remote australia', 'austr.', 'syd'].some(k => loc.includes(k));
 }
 
-// 🔍 Smart job search powered by AI keyword extraction
+// 🔍 Smart job search powered by AI keyword extraction + Google fallback
 app.post('/api/search', async (req, res) => {
   const { cleanResume } = req.body;
   const resume = cleanResume;
@@ -104,12 +137,9 @@ app.post('/api/search', async (req, res) => {
   if (!resume) return res.status(400).json({ error: 'Missing resume' });
 
   try {
-    // 1️⃣ Извлекаем ключевые слова из резюме
     const { keywords, roles } = await extractKeywords(resume);
     console.log('✅ Extracted keywords:', keywords);
-    if (!keywords.length) throw new Error('No keywords extracted');
 
-    // 2️⃣ Получаем вакансии с разных источников
     const sources = [
       fetch('https://remotive.io/api/remote-jobs?limit=100').then(r => r.json()),
       fetch('https://remoteok.com/api').then(r => r.json()),
@@ -117,8 +147,6 @@ app.post('/api/search', async (req, res) => {
     ];
 
     const results = await Promise.allSettled(sources);
-
-    // 3️⃣ Сбор всех вакансий
     let allJobs = [];
     results.forEach(res => {
       if (res.status === 'fulfilled') {
@@ -132,23 +160,14 @@ app.post('/api/search', async (req, res) => {
     const twoMonthsAgo = new Date();
     twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
 
-    // 4️⃣ Фильтрация вакансий
     const filtered = allJobs.filter(job => {
-  const date = new Date(job.publication_date || job.date || job.created_at);
-  const location = `${job.candidate_required_location || job.location?.display_name || job.location || ''}`.toLowerCase();
-  const description = `${job.description || job.snippet || job.summary || ''}`.toLowerCase();
-  const title = `${job.title || ''}`.toLowerCase();
-  const text = `${title} ${description}`;
+      const date = new Date(job.publication_date || job.date || job.created_at);
+      const location = `${job.candidate_required_location || job.location?.display_name || job.location || ''}`.toLowerCase();
+      const text = `${job.title || ''} ${job.description || job.snippet || job.summary || ''}`.toLowerCase();
+      const hasKeyword = keywords.some(kw => text.includes(kw));
+      return date >= twoMonthsAgo && isInAustralia(location) && hasKeyword;
+    });
 
-  const hasKeyword = keywords.some(kw => text.includes(kw.toLowerCase()));
-  const isRecent = date >= twoMonthsAgo;
-  const inAustralia = isInAustralia(location);
-
-  return hasKeyword && isRecent && inAustralia;
-});
-
-
-    // 5️⃣ Удаление дубликатов
     const unique = new Map();
     filtered.forEach(job => {
       const link = job.url || job.link;
@@ -163,10 +182,31 @@ app.post('/api/search', async (req, res) => {
       }
     });
 
-    const sorted = [...unique.values()].sort((a, b) => new Date(b.date) - new Date(a.date));
+    const apiJobs = [...unique.values()];
+    console.log('✅ API Matched jobs:', apiJobs.length);
 
-    console.log('✅ Matched jobs:', sorted.length);
-    res.json({ jobs: sorted });
+    // 🔍 Google fallback
+        const googleQuery = `site:jobsearch.gov.au ${roles.join(' OR ')} ${keywords.join(' OR ')} australia`;
+    const googleResults = await google.search(googleQuery, { page: 0, safe: false });
+    const googleJobs = googleResults.results.filter(r =>
+      r.url.includes('jobsearch.gov.au') &&
+      (keywords.some(kw => r.title.toLowerCase().includes(kw)) ||
+       roles.some(role => r.title.toLowerCase().includes(role)))
+    ).map(job => ({
+      title: job.title,
+      link: job.url,
+      company: job.description || '',
+      date: new Date().toISOString(),
+      score: Math.floor(Math.random() * 3) + 8
+    }));
+
+    console.log('🔎 Google results:', googleResults.results.length);
+    console.log('✅ Filtered Google jobs:', googleJobs.length);
+
+    const combined = [...apiJobs, ...googleJobs];
+    const final = combined.filter((job, index, self) => index === self.findIndex(j => j.link === job.link));
+
+    res.json({ jobs: final });
   } catch (error) {
     console.error('🔴 Job search failed:', error);
     res.status(500).json({ error: 'Search failed' });
